@@ -1,0 +1,13 @@
+// MESIF Two Level Protocol
+// Based on MESI_Two_Level with added Forward (F) state for CXL coherence
+// 
+// The Forward state designates one sharer as the "designated responder"
+// for shared requests, reducing memory bandwidth by allowing cache-to-cache
+// transfers.
+
+protocol "MESIF_Two_Level" use_secondary_load_linked;
+include "MESIF_Two_Level-msg.sm";
+include "MESIF_Two_Level-L1cache.sm";
+include "MESIF_Two_Level-L2cache.sm";
+include "MESIF_Two_Level-dir.sm";
+include "MESIF_Two_Level-dma.sm";

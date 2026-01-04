@@ -1,0 +1,98 @@
+/*
+ * Copyright (c) 2024 CXL MESIF Protocol
+ * Based on MESI_Two_Level-msg.sm with Forward state support
+ *
+ * MESIF adds the Forward (F) state which designates one sharer
+ * as the "designated responder" for shared data requests.
+ */
+
+// CoherenceRequestType - Extended for MESIF
+enumeration(CoherenceRequestType, desc="Types of coherence requests") {
+  GETX,      desc="Get eXclusive - request exclusive copy";
+  UPGRADE,   desc="UPGRADE to exclusive from shared";
+  GETS,      desc="Get Shared - request shared copy";
+  GET_INSTR, desc="Get Instruction - request instruction fetch";
+  INV,       desc="INValidate - invalidate cache line";
+  PUTX,      desc="Replacement message - evicting modified data";
+  
+  // MESIF-specific: Request to become the Forward holder
+  GETF,      desc="Get Forward - request to be designated responder";
+  
+  WB_ACK,    desc="Writeback ack";
+
+  DMA_READ,  desc="DMA Read";
+  DMA_WRITE, desc="DMA Write";
+}
+
+// CoherenceResponseType - Extended for MESIF
+enumeration(CoherenceResponseType, desc="Types of coherence responses") {
+  MEMORY_ACK, desc="Ack from memory controller";
+  DATA, desc="Data block for L1 cache in S state";
+  DATA_EXCLUSIVE, desc="Data block for L1 cache in M/E state";
+  MEMORY_DATA, desc="Data block from / to main memory";
+  ACK, desc="Generic invalidate ack";
+  WB_ACK, desc="writeback ack";
+  UNBLOCK, desc="unblock";
+  EXCLUSIVE_UNBLOCK, desc="exclusive unblock";
+  INV, desc="Invalidate from directory";
+  
+  // MESIF-specific responses
+  DATA_FORWARD, desc="Data from Forward holder (cache-to-cache transfer)";
+  FORWARD_ACK, desc="Acknowledgment of Forward state transfer";
+}
+
+// RequestMsg - Standard request message structure
+structure(RequestMsg, desc="Request message structure", interface="Message") {
+  Addr addr,              desc="Physical address for this request";
+  CoherenceRequestType Type,    desc="Type of request (GetS, GetX, PutX, etc)";
+  RubyAccessMode AccessMode,    desc="user/supervisor access type";
+  MachineID Requestor,          desc="What component made the request";
+  NetDest Destination,          desc="What components receive the request";
+  MessageSizeType MessageSize,  desc="size category of the message";
+  DataBlock DataBlk,            desc="Data for the cache line (if PUTX)";
+  int Len;
+  bool Dirty, default="false",  desc="Dirty bit";
+  PrefetchBit Prefetch,         desc="Is this a prefetch request";
+
+  bool functionalRead(Packet *pkt) {
+    // Only PUTX messages contains the data block
+    if (Type == CoherenceRequestType:PUTX) {
+        return testAndRead(addr, DataBlk, pkt);
+    }
+    return false;
+  }
+
+  bool functionalWrite(Packet *pkt) {
+    return testAndWrite(addr, DataBlk, pkt);
+  }
+}
+
+// ResponseMsg - Standard response message structure
+structure(ResponseMsg, desc="Response message structure", interface="Message") {
+  Addr addr,              desc="Physical address for this request";
+  CoherenceResponseType Type,   desc="Type of response (Ack, Data, etc)";
+  MachineID Sender,             desc="What component sent the data";
+  NetDest Destination,          desc="Node to whom the data is sent";
+  DataBlock DataBlk,            desc="Data for the cache line";
+  bool Dirty, default="false",  desc="Dirty bit";
+  int AckCount, default="0",    desc="number of acks in this message";
+  MessageSizeType MessageSize,  desc="size category of the message";
+  
+  // MESIF-specific: Track the Forward holder
+  MachineID ForwardHolder,      desc="The machine that holds the Forward state";
+  bool HasForward, default="false", desc="Whether a Forward holder exists";
+
+  bool functionalRead(Packet *pkt) {
+    if (Type == CoherenceResponseType:DATA ||
+        Type == CoherenceResponseType:DATA_EXCLUSIVE ||
+        Type == CoherenceResponseType:MEMORY_DATA ||
+        Type == CoherenceResponseType:DATA_FORWARD) {
+        return testAndRead(addr, DataBlk, pkt);
+    }
+    return false;
+  }
+
+  bool functionalWrite(Packet *pkt) {
+    return testAndWrite(addr, DataBlk, pkt);
+  }
+}

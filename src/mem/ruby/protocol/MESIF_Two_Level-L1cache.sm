@@ -1,0 +1,518 @@
+/*
+ * Copyright (c) 2024 CXL MESIF Protocol
+ * Based on MESI_Two_Level-L1cache.sm with Forward (F) state
+ *
+ * MESIF Protocol L1 Cache State Machine
+ * The Forward state allows one sharer to respond to shared requests,
+ * reducing memory bandwidth by enabling cache-to-cache transfers.
+ */
+
+machine(MachineType:L1Cache, "MESIF Directory L1 Cache CMP")
+ : Sequencer * sequencer;
+   CacheMemory * L1Icache;
+   CacheMemory * L1Dcache;
+   RubyPrefetcher * prefetcher;
+   int l2_select_num_bits;
+   Cycles l1_request_latency := 2;
+   Cycles l1_response_latency := 2;
+   Cycles to_l2_latency := 1;
+   Cycles llsc_lock_timeout_latency := 16;
+   bool use_llsc_lock := "True";
+   bool send_evictions;
+   bool enable_prefetch := "False";
+
+   // Message Queues
+   MessageBuffer * requestFromL1Cache, network="To", virtual_network="0",
+        vnet_type="request";
+   MessageBuffer * responseFromL1Cache, network="To", virtual_network="1",
+        vnet_type="response";
+   MessageBuffer * unblockFromL1Cache, network="To", virtual_network="2",
+        vnet_type="unblock";
+
+   MessageBuffer * requestToL1Cache, network="From", virtual_network="2",
+        vnet_type="request";
+   MessageBuffer * responseToL1Cache, network="From", virtual_network="1",
+        vnet_type="response";
+
+  MessageBuffer * optionalQueue;
+  MessageBuffer * mandatoryQueue;
+{
+  // ============================================================================
+  // STATES - MESIF adds the Forward (F) state
+  // ============================================================================
+  state_declaration(State, desc="Cache states", default="L1Cache_State_I") {
+    // Base MESIF states
+    NP, AccessPermission:Invalid, desc="Not present in either cache";
+    I, AccessPermission:Invalid, desc="Invalid - cache entry not valid";
+    S, AccessPermission:Read_Only, desc="Shared - read-only copy, NOT the responder";
+    E, AccessPermission:Read_Only, desc="Exclusive - only copy, clean";
+    M, AccessPermission:Read_Write, desc="Modified - only copy, dirty", format="!b";
+    
+    // MESIF Forward state - designated responder for shared requests
+    F, AccessPermission:Read_Only, desc="Forward - shared copy, designated to respond to GETS";
+
+    // Transient States
+    IS, AccessPermission:Busy, desc="Issued GETS, waiting for response";
+    IM, AccessPermission:Busy, desc="Issued GETX, waiting for response";
+    SM, AccessPermission:Read_Only, desc="Shared, issued GETX for upgrade, waiting";
+    IS_I, AccessPermission:Busy, desc="Issued GETS, saw Inv before data";
+    
+    // MESIF-specific transient states
+    IF, AccessPermission:Busy, desc="Issued GETS, will become Forward holder";
+    SF, AccessPermission:Busy, desc="Shared, transitioning to Forward";
+
+    M_I, AccessPermission:Busy, desc="Modified, replacing, waiting for ACK";
+    F_I, AccessPermission:Busy, desc="Forward, replacing, waiting for ACK";
+    SINK_WB_ACK, AccessPermission:Busy, desc="Sinking WB_Acks from L2";
+
+    // Prefetch transient states
+    PF_IS, AccessPermission:Busy, desc="Prefetch: Issued GETS, waiting";
+    PF_IM, AccessPermission:Busy, desc="Prefetch: Issued GETX, waiting";
+    PF_SM, AccessPermission:Busy, desc="Prefetch: Issued GETX, received data, waiting for acks";
+    PF_IS_I, AccessPermission:Busy, desc="Prefetch: Issued GETS, saw inv";
+
+    // LL/SC states
+    LLSC_E, AccessPermission:Read_Only, desc="Exclusive with LL/SC lock";
+    LLSC_M, AccessPermission:Read_Write, desc="Modified with LL/SC lock";
+  }
+
+  // ============================================================================
+  // EVENTS - Extended for MESIF
+  // ============================================================================
+  enumeration(Event, desc="Cache events") {
+    // CPU events
+    Load,            desc="Load request from processor";
+    Ifetch,          desc="I-fetch request from processor";
+    Store,           desc="Store request from processor";
+
+    Inv,             desc="Invalidate request from L2 bank";
+
+    // Replacement events
+    L1_Replacement,  desc="L1 Replacement", format="!r";
+    PF_L1_Replacement,  desc="Prefetch L1 Replacement", format="!pr";
+
+    // Forwarded requests
+    Fwd_GETX,   desc="GETX from other processor (need to invalidate)";
+    Fwd_GETS,   desc="GETS from other processor (may need to supply data if F)";
+    Fwd_GET_INSTR,   desc="GET_INSTR from other processor";
+
+    // Data responses
+    Data,       desc="Data for processor (becomes Shared)";
+    Data_Exclusive,       desc="Data for processor (becomes Exclusive)";
+    DataS_fromL1,       desc="Data for GETS, from another L1";
+    Data_all_Acks,       desc="Data with all acks";
+    
+    // MESIF-specific events
+    Data_Forward,   desc="Data with Forward token (becomes F state)";
+    Fwd_Transfer,   desc="Transfer Forward responsibility to another cache";
+
+    Ack,        desc="Ack for processor";
+    Ack_all,    desc="Last ack for processor";
+
+    WB_Ack,     desc="Ack for replacement";
+
+    // Prefetch events
+    PF_Load,    desc="Load request from prefetcher";
+    PF_Ifetch,  desc="Instruction fetch from prefetcher";
+    PF_Store,   desc="Exclusive load from prefetcher";
+
+    // LL/SC events
+    Load_Linked,        desc="Load-Linked request";
+    LLSC_Data_all_Acks, desc="Data for LL/SC, all acks";
+    LLSC_Ack_all,       desc="Last ack for LL/SC";
+    LLSC_Timeout,       desc="LL/SC lock timeout";
+  }
+
+  // ============================================================================
+  // TYPES
+  // ============================================================================
+  
+  // CacheEntry - Extended for MESIF
+  structure(Entry, desc="L1 Cache Entry", interface="AbstractCacheEntry") {
+    State CacheState,        desc="cache state";
+    DataBlock DataBlk,       desc="data for the block";
+    bool Dirty, default="false",   desc="data is dirty";
+    bool isPrefetch, desc="Set if prefetched and not yet accessed";
+    bool isForward, default="false", desc="True if this cache is the Forward holder";
+  }
+
+  // TBE fields
+  structure(TBE, desc="Transaction Buffer Entry") {
+    Addr addr,              desc="Physical address for this TBE";
+    State TBEState,        desc="Transient state";
+    DataBlock DataBlk,     desc="Buffer for the data block";
+    bool Dirty, default="false",   desc="data is dirty";
+    bool isPrefetch,       desc="Set if caused by prefetch";
+    int pendingAcks, default="0", desc="number of pending acks";
+    bool isLoadLinked, default="false", desc="Set if caused by Load-Linked";
+    bool willBeForward, default="false", desc="True if will become Forward holder";
+  }
+
+  structure(TBETable, external="yes") {
+    TBE lookup(Addr);
+    void allocate(Addr);
+    void deallocate(Addr);
+    bool isPresent(Addr);
+  }
+
+  TBETable TBEs, template="<L1Cache_TBE>", constructor="m_number_of_TBEs";
+  TimerTable llscLockTimerTable;
+
+  int l2_select_low_bit, default="m_ruby_system->getBlockSizeBits()";
+
+  Tick clockEdge();
+  Tick cyclesToTicks(Cycles c);
+  Cycles ticksToCycles(Tick t);
+  void set_cache_entry(AbstractCacheEntry a);
+  void unset_cache_entry();
+  void set_tbe(TBE a);
+  void unset_tbe();
+  void wakeUpBuffers(Addr a);
+  void profileMsgDelay(int virtualNetworkType, Cycles c);
+
+  // Cache entry lookup
+  Entry getCacheEntry(Addr addr), return_by_pointer="yes" {
+    Entry L1Dcache_entry := static_cast(Entry, "pointer", L1Dcache[addr]);
+    if(is_valid(L1Dcache_entry)) {
+      return L1Dcache_entry;
+    }
+    Entry L1Icache_entry := static_cast(Entry, "pointer", L1Icache[addr]);
+    return L1Icache_entry;
+  }
+
+  Entry getL1DCacheEntry(Addr addr), return_by_pointer="yes" {
+    Entry L1Dcache_entry := static_cast(Entry, "pointer", L1Dcache[addr]);
+    return L1Dcache_entry;
+  }
+
+  Entry getL1ICacheEntry(Addr addr), return_by_pointer="yes" {
+    Entry L1Icache_entry := static_cast(Entry, "pointer", L1Icache[addr]);
+    return L1Icache_entry;
+  }
+
+  State getState(TBE tbe, Entry cache_entry, Addr addr) {
+    if(is_valid(tbe)) {
+      return tbe.TBEState;
+    } else if (is_valid(cache_entry)) {
+      return cache_entry.CacheState;
+    }
+    return State:NP;
+  }
+
+  void setState(TBE tbe, Entry cache_entry, Addr addr, State state) {
+    if (is_valid(tbe)) {
+      tbe.TBEState := state;
+    }
+    if (is_valid(cache_entry)) {
+      cache_entry.CacheState := state;
+      // Update Forward holder flag
+      if (state == State:F) {
+        cache_entry.isForward := true;
+      } else {
+        cache_entry.isForward := false;
+      }
+    }
+  }
+
+  AccessPermission getAccessPermission(Addr addr) {
+    TBE tbe := TBEs[addr];
+    if(is_valid(tbe)) {
+      return L1Cache_State_to_permission(tbe.TBEState);
+    }
+    Entry cache_entry := getCacheEntry(addr);
+    if(is_valid(cache_entry)) {
+      return L1Cache_State_to_permission(cache_entry.CacheState);
+    }
+    return AccessPermission:NotPresent;
+  }
+
+  void setAccessPermission(Entry cache_entry, Addr addr, State state) {
+    if (is_valid(cache_entry)) {
+      cache_entry.changePermission(L1Cache_State_to_permission(state));
+    }
+  }
+
+  // ============================================================================
+  // OUT PORTS
+  // ============================================================================
+  out_port(requestL1Network_out, RequestMsg, requestFromL1Cache);
+  out_port(responseL1Network_out, ResponseMsg, responseFromL1Cache);
+  out_port(unblockNetwork_out, ResponseMsg, unblockFromL1Cache);
+  out_port(optionalQueue_out, RubyRequest, optionalQueue);
+
+  // ============================================================================
+  // IN PORTS
+  // ============================================================================
+  
+  // Mandatory Queue Port (CPU requests)
+  in_port(mandatoryQueue_in, RubyRequest, mandatoryQueue, desc="Requests from CPU") {
+    if (mandatoryQueue_in.isReady(clockEdge())) {
+      peek(mandatoryQueue_in, RubyRequest, block_on="LineAddress") {
+        Entry cache_entry := getCacheEntry(in_msg.LineAddress);
+        TBE tbe := TBEs[in_msg.LineAddress];
+        
+        if (in_msg.Type == RubyRequestType:IFETCH) {
+          trigger(Event:Ifetch, in_msg.LineAddress, cache_entry, tbe);
+        } else if (in_msg.Type == RubyRequestType:LD) {
+          trigger(Event:Load, in_msg.LineAddress, cache_entry, tbe);
+        } else if (in_msg.Type == RubyRequestType:ST) {
+          trigger(Event:Store, in_msg.LineAddress, cache_entry, tbe);
+        } else {
+          error("Invalid request type");
+        }
+      }
+    }
+  }
+
+  // ============================================================================
+  // ACTIONS - Extended for MESIF
+  // ============================================================================
+  
+  // Action: Send GETS request
+  action(a_issueGETS, "a", desc="Issue GETS") {
+    enqueue(requestL1Network_out, RequestMsg, l1_request_latency) {
+      out_msg.addr := address;
+      out_msg.Type := CoherenceRequestType:GETS;
+      out_msg.Requestor := machineID;
+      // Calculate L2 bank destination
+      out_msg.Destination.add(mapAddressToRange(address, MachineType:L2Cache,
+                          l2_select_low_bit, l2_select_num_bits));
+      out_msg.MessageSize := MessageSizeType:Control;
+    }
+  }
+  
+  // Action: Send GETX request (for exclusive access)
+  action(b_issueGETX, "b", desc="Issue GETX") {
+    enqueue(requestL1Network_out, RequestMsg, l1_request_latency) {
+      out_msg.addr := address;
+      out_msg.Type := CoherenceRequestType:GETX;
+      out_msg.Requestor := machineID;
+      out_msg.Destination.add(mapAddressToRange(address, MachineType:L2Cache,
+                          l2_select_low_bit, l2_select_num_bits));
+      out_msg.MessageSize := MessageSizeType:Control;
+    }
+  }
+  
+  // MESIF-specific action: Respond to GETS as Forward holder
+  action(f_sendDataAsForward, "f", desc="Send data as Forward holder") {
+    peek(requestToL1Cache, RequestMsg) {
+      enqueue(responseL1Network_out, ResponseMsg, l1_response_latency) {
+        assert(is_valid(cache_entry));
+        out_msg.addr := address;
+        out_msg.Type := CoherenceResponseType:DATA_FORWARD;
+        out_msg.Sender := machineID;
+        out_msg.Destination.add(in_msg.Requestor);
+        out_msg.DataBlk := cache_entry.DataBlk;
+        out_msg.Dirty := cache_entry.Dirty;
+        out_msg.MessageSize := MessageSizeType:Response_Data;
+        out_msg.HasForward := true;
+        out_msg.ForwardHolder := in_msg.Requestor;  // New requester becomes Forward
+      }
+    }
+  }
+  
+  // Action: Transition from Forward to Shared (gave away Forward token)
+  action(g_transitionFtoS, "g", desc="Transition F->S after forwarding data") {
+    assert(is_valid(cache_entry));
+    cache_entry.isForward := false;
+  }
+  
+  // Action: Read data from cache and send to CPU
+  action(h_load_hit, "h", desc="Load hit - return data to CPU") {
+    assert(is_valid(cache_entry));
+    DPRINTF(RubySlicc, "Load hit: data %s\n", cache_entry.DataBlk);
+    sequencer.readCallback(address, cache_entry.DataBlk, false);
+  }
+  
+  // Action: Write data to cache
+  action(hh_store_hit, "\h", desc="Store hit - update data") {
+    assert(is_valid(cache_entry));
+    DPRINTF(RubySlicc, "Store hit: data %s\n", cache_entry.DataBlk);
+    sequencer.writeCallback(address, cache_entry.DataBlk, false);
+    cache_entry.Dirty := true;
+  }
+  
+  // Action: Allocate cache entry
+  action(i_allocateTBE, "i", desc="Allocate TBE") {
+    check_allocate(TBEs);
+    TBEs.allocate(address);
+    set_tbe(TBEs[address]);
+    tbe.addr := address;
+    tbe.isPrefetch := false;
+    tbe.willBeForward := false;
+  }
+  
+  // Action: Mark TBE as will-become-Forward
+  action(i_markWillBeForward, "iF", desc="Mark TBE to become Forward") {
+    assert(is_valid(tbe));
+    tbe.willBeForward := true;
+  }
+  
+  // Action: Pop mandatory queue
+  action(m_popMandatoryQueue, "m", desc="Pop mandatory queue") {
+    mandatoryQueue_in.dequeue(clockEdge());
+  }
+  
+  // Action: Pop request queue
+  action(n_popRequestQueue, "n", desc="Pop request queue") {
+    requestToL1Cache.dequeue(clockEdge());
+  }
+  
+  // Action: Pop response queue
+  action(o_popResponseQueue, "o", desc="Pop response queue") {
+    responseToL1Cache.dequeue(clockEdge());
+  }
+  
+  // ============================================================================
+  // TRANSITIONS - Core MESIF state machine
+  // ============================================================================
+  
+  // --- Invalid state transitions ---
+  
+  // I -> IS: Load miss
+  transition(I, Load, IS) {
+    i_allocateTBE;
+    a_issueGETS;
+    m_popMandatoryQueue;
+  }
+  
+  // I -> IM: Store miss
+  transition(I, Store, IM) {
+    i_allocateTBE;
+    b_issueGETX;
+    m_popMandatoryQueue;
+  }
+  
+  // --- Shared state transitions ---
+  
+  // S: Load hit
+  transition(S, Load) {
+    h_load_hit;
+    m_popMandatoryQueue;
+  }
+  
+  // S -> SM: Store to shared (upgrade)
+  transition(S, Store, SM) {
+    i_allocateTBE;
+    b_issueGETX;
+    m_popMandatoryQueue;
+  }
+  
+  // S -> I: Invalidation
+  transition(S, Inv, I) {
+    // Send ACK, deallocate
+    n_popRequestQueue;
+  }
+  
+  // --- Forward state transitions (MESIF-specific) ---
+  
+  // F: Load hit
+  transition(F, Load) {
+    h_load_hit;
+    m_popMandatoryQueue;
+  }
+  
+  // F -> SM: Store to Forward (upgrade, lose Forward token)
+  transition(F, Store, SM) {
+    i_allocateTBE;
+    b_issueGETX;
+    m_popMandatoryQueue;
+  }
+  
+  // F -> S: Received GETS, respond with data, transfer Forward token
+  transition(F, Fwd_GETS, S) {
+    f_sendDataAsForward;  // Send data and transfer Forward token
+    g_transitionFtoS;     // We become regular Shared
+    n_popRequestQueue;
+  }
+  
+  // F -> I: Invalidation
+  transition(F, Inv, I) {
+    // Send ACK, deallocate
+    n_popRequestQueue;
+  }
+  
+  // --- Exclusive state transitions ---
+  
+  // E: Load hit
+  transition(E, Load) {
+    h_load_hit;
+    m_popMandatoryQueue;
+  }
+  
+  // E -> M: Store to Exclusive (silent upgrade)
+  transition(E, Store, M) {
+    hh_store_hit;
+    m_popMandatoryQueue;
+  }
+  
+  // E -> S: Downgrade on Fwd_GETS
+  transition(E, Fwd_GETS, S) {
+    // Send data, become Shared
+    n_popRequestQueue;
+  }
+  
+  // E -> I: Invalidation on Fwd_GETX
+  transition(E, Fwd_GETX, I) {
+    // Send data, invalidate
+    n_popRequestQueue;
+  }
+  
+  // --- Modified state transitions ---
+  
+  // M: Load hit
+  transition(M, Load) {
+    h_load_hit;
+    m_popMandatoryQueue;
+  }
+  
+  // M: Store hit
+  transition(M, Store) {
+    hh_store_hit;
+    m_popMandatoryQueue;
+  }
+  
+  // M -> S: Downgrade on Fwd_GETS
+  transition(M, Fwd_GETS, S) {
+    // Send dirty data, become Shared
+    n_popRequestQueue;
+  }
+  
+  // M -> I: Invalidation on Fwd_GETX
+  transition(M, Fwd_GETX, I) {
+    // Send dirty data, invalidate
+    n_popRequestQueue;
+  }
+  
+  // --- Transient state transitions ---
+  
+  // IS -> S: Data received (normal)
+  transition(IS, Data, S) {
+    // Write data to cache, unblock
+    o_popResponseQueue;
+  }
+  
+  // IS -> F: Data received with Forward token
+  transition(IS, Data_Forward, F) {
+    // Write data to cache, become Forward holder
+    o_popResponseQueue;
+  }
+  
+  // IS -> E: Exclusive data received
+  transition(IS, Data_Exclusive, E) {
+    // Write data to cache, have exclusive copy
+    o_popResponseQueue;
+  }
+  
+  // IM -> M: Data received with all acks
+  transition(IM, Data_all_Acks, M) {
+    // Write data to cache, have modified copy
+    o_popResponseQueue;
+  }
+  
+  // SM -> M: Got all acks for upgrade
+  transition(SM, Ack_all, M) {
+    // Upgrade complete
+    o_popResponseQueue;
+  }
+}
